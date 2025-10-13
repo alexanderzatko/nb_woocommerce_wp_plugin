@@ -144,7 +144,12 @@ function nb_woocommerce_wp_plugin_voucher_generation($access_token, $order_data)
     $existing_user = nb_woocommerce_wp_plugin_find_user_by_email($email);
     $is_registered_user = ($existing_user !== FALSE);
     
-    watchdog('nb_woocommerce_wp_plugin', 'User lookup result: @result', array('@result' => $is_registered_user ? 'registered' : 'anonymous'));
+    if ($is_registered_user) {
+      watchdog('nb_woocommerce_wp_plugin', 'User lookup result: registered user found, uid: @uid', 
+        array('@uid' => $existing_user->uid));
+    } else {
+      watchdog('nb_woocommerce_wp_plugin', 'User lookup result: anonymous user');
+    }
     
     // Determine voucher type and quantity based on amount
     $season_pass_price = variable_get('nb_pass_cost', 20);
@@ -163,6 +168,9 @@ function nb_woocommerce_wp_plugin_voucher_generation($access_token, $order_data)
     if ($is_registered_user) {
       // Handle registered user - update their access end date
       $result = nb_woocommerce_wp_plugin_process_registered_user($existing_user, $amount, $season_pass_price);
+      if ($result === FALSE) {
+        throw new Exception('Failed to process registered user order');
+      }
       $voucher_data['user_uid'] = $existing_user->uid;
       $voucher_data['access_granted'] = TRUE;
     } else {
@@ -224,9 +232,20 @@ function nb_woocommerce_wp_plugin_find_user_by_email($email) {
   $users = entity_load_multiple_by_properties('user', array('mail' => $email, 'status' => 1));
   
   if (!empty($users)) {
-    return reset($users);
+    $user = reset($users);
+    // Ensure we have a proper user object by loading it again with user_load
+    if (isset($user->uid)) {
+      $full_user = user_load($user->uid);
+      if ($full_user && is_object($full_user) && isset($full_user->uid)) {
+        watchdog('nb_woocommerce_wp_plugin', 'Found registered user for email @email, uid: @uid', 
+          array('@email' => $email, '@uid' => $full_user->uid), WATCHDOG_INFO);
+        return $full_user;
+      }
+    }
   }
   
+  watchdog('nb_woocommerce_wp_plugin', 'No registered user found for email @email', 
+    array('@email' => $email), WATCHDOG_INFO);
   return FALSE;
 }
 
@@ -234,22 +253,34 @@ function nb_woocommerce_wp_plugin_find_user_by_email($email) {
  * Process registered user order.
  */
 function nb_woocommerce_wp_plugin_process_registered_user($user, $amount, $season_pass_price) {
-  $usrobj = entity_metadata_wrapper('user', $user);
-  
-  if ($amount >= $season_pass_price) {
-    // Seasonal pass - set access until end of season
-    $end_date = rules_invoke_component('rules_end_of_ski_season')[0];
-    $usrobj->field_cc_access_end_date->set($end_date);
-  } else {
-    // 3-day access - extend current access by 3 days
-    $current_end = $usrobj->field_cc_access_end_date->value();
-    $new_end = max($current_end, time()) + (3 * 24 * 60 * 60);
-    $usrobj->field_cc_access_end_date->set($new_end);
+  // Ensure we have a valid user object with uid
+  if (!is_object($user) || !isset($user->uid)) {
+    watchdog('nb_woocommerce_wp_plugin', 'Invalid user object passed to process_registered_user', array(), WATCHDOG_ERROR);
+    return FALSE;
   }
   
-  $usrobj->save();
-  
-  return TRUE;
+  try {
+    $usrobj = entity_metadata_wrapper('user', $user);
+    
+    if ($amount >= $season_pass_price) {
+      // Seasonal pass - set access until end of season
+      $end_date = rules_invoke_component('rules_end_of_ski_season')[0];
+      $usrobj->field_cc_access_end_date->set($end_date);
+    } else {
+      // 3-day access - extend current access by 3 days
+      $current_end = $usrobj->field_cc_access_end_date->value();
+      $new_end = max($current_end, time()) + (3 * 24 * 60 * 60);
+      $usrobj->field_cc_access_end_date->set($new_end);
+    }
+    
+    $usrobj->save();
+    
+    return TRUE;
+  } catch (Exception $e) {
+    watchdog('nb_woocommerce_wp_plugin', 'Error processing registered user @uid: @error', 
+      array('@uid' => $user->uid, '@error' => $e->getMessage()), WATCHDOG_ERROR);
+    return FALSE;
+  }
 }
 
 /**
