@@ -77,6 +77,10 @@ function nb_woocommerce_wp_plugin_admin_form_submit($form, &$form_state) {
  * This function processes WooCommerce orders and generates appropriate vouchers.
  */
 function nb_woocommerce_wp_plugin_voucher_generation($access_token, $order_data) {
+  // Debug logging to track function parameters
+  watchdog('nb_woocommerce_wp_plugin', 'Function called with parameters: <pre>@params</pre>', 
+    array('@params' => print_r(array('access_token' => $access_token, 'order_data' => $order_data), TRUE)), WATCHDOG_DEBUG);
+  
   // Validate access token first
   $allowed_tokens = variable_get('nb_woocommerce_wp_plugin_tokens', array());
   if (empty($allowed_tokens) || !in_array($access_token, $allowed_tokens)) {
