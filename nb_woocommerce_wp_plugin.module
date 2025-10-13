@@ -1,0 +1,446 @@
+<?php
+
+/**
+ * @file
+ * WooCommerce WordPress Plugin integration module for Nábežky.
+ * 
+ * This module provides API endpoints for WordPress WooCommerce plugin
+ * to generate vouchers and handle user authentication.
+ */
+
+/**
+ * Implements hook_menu().
+ */
+function nb_woocommerce_wp_plugin_menu() {
+  $items = array();
+  
+  // Admin configuration page
+  $items['admin/config/services/nb_woocommerce_wp_plugin'] = array(
+    'title' => t('WooCommerce WP Plugin Settings'),
+    'description' => t('Configure settings for WordPress WooCommerce plugin integration'),
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('nb_woocommerce_wp_plugin_admin_form'),
+    'access arguments' => array('administer site configuration'),
+    'menu_name' => 'management'
+  );
+  
+  return $items;
+}
+
+/**
+ * Admin configuration form.
+ */
+function nb_woocommerce_wp_plugin_admin_form($form, &$form_state) {
+  $form['info'] = array(
+    '#type' => 'markup',
+    '#markup' => '<div><strong>WooCommerce WordPress Plugin Integration</strong></div>',
+  );
+  
+  $form['allowed_tokens'] = array(
+    '#type' => 'textarea',
+    '#title' => t('Allowed Access Tokens'),
+    '#description' => t('Enter one access token per line. These tokens will be used to authenticate WordPress plugin requests.'),
+    '#default_value' => implode("\n", variable_get('nb_woocommerce_wp_plugin_tokens', array())),
+    '#rows' => 5,
+  );
+  
+  $form['callback_timeout'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Callback Timeout'),
+    '#description' => t('Maximum time in seconds to wait for WordPress callback response.'),
+    '#default_value' => variable_get('nb_woocommerce_wp_plugin_callback_timeout', 30),
+    '#size' => 10,
+  );
+  
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Save Configuration'),
+  );
+  
+  return $form;
+}
+
+/**
+ * Admin form submit handler.
+ */
+function nb_woocommerce_wp_plugin_admin_form_submit($form, &$form_state) {
+  $tokens = array_filter(array_map('trim', explode("\n", $form_state['values']['allowed_tokens'])));
+  variable_set('nb_woocommerce_wp_plugin_tokens', $tokens);
+  variable_set('nb_woocommerce_wp_plugin_callback_timeout', $form_state['values']['callback_timeout']);
+  
+  drupal_set_message(t('Configuration saved successfully.'));
+}
+
+/**
+ * Services endpoint for voucher generation.
+ * 
+ * This function processes WooCommerce orders and generates appropriate vouchers.
+ */
+function nb_woocommerce_wp_plugin_voucher_generation($access_token, $order_data) {
+  // Validate access token first
+  $allowed_tokens = variable_get('nb_woocommerce_wp_plugin_tokens', array());
+  if (empty($allowed_tokens) || !in_array($access_token, $allowed_tokens)) {
+    watchdog('nb_woocommerce_wp_plugin', 'Invalid access token used: @token', array('@token' => $access_token), WATCHDOG_WARNING);
+    $error_response = array(
+      'status' => 'error',
+      'message' => 'Invalid or missing access token',
+      'error_code' => 401
+    );
+    drupal_add_http_header('Content-Type', 'application/json');
+    http_response_code(401);
+    echo json_encode($error_response);
+    drupal_exit();
+  }
+  
+  // Validate required order data
+  if (empty($order_data['email']) || empty($order_data['amount'])) {
+    $error_response = array(
+      'status' => 'error',
+      'message' => 'Missing required order data',
+      'error_code' => 400
+    );
+    drupal_add_http_header('Content-Type', 'application/json');
+    http_response_code(400);
+    echo json_encode($error_response);
+    drupal_exit();
+  }
+  
+  // Validate email format using existing Nabezky function
+  if (!function_exists('nb_gmm_validate_email')) {
+    watchdog('nb_woocommerce_wp_plugin', 'nb_gmm_validate_email function not found - nb_grooming_map module may not be enabled', array(), WATCHDOG_ERROR);
+    $error_response = array(
+      'status' => 'error',
+      'message' => 'Required module not available',
+      'error_code' => 500
+    );
+    drupal_add_http_header('Content-Type', 'application/json');
+    http_response_code(500);
+    echo json_encode($error_response);
+    drupal_exit();
+  }
+  
+  if (!nb_gmm_validate_email($order_data['email'])) {
+    $error_response = array(
+      'status' => 'error',
+      'message' => 'Invalid email format',
+      'error_code' => 400
+    );
+    drupal_add_http_header('Content-Type', 'application/json');
+    http_response_code(400);
+    echo json_encode($error_response);
+    drupal_exit();
+  }
+  
+  $email = $order_data['email'];
+  $amount = floatval($order_data['amount']);
+  $order_id = $order_data['order_id'];
+  $region_id = isset($order_data['region_id']) ? intval($order_data['region_id']) : 1;
+  
+  watchdog('nb_woocommerce_wp_plugin', 'Processing WooCommerce order: @order_id, email: @email, amount: @amount, region_id: @region_id', 
+    array('@order_id' => $order_id, '@email' => $email, '@amount' => $amount, '@region_id' => $region_id));
+  
+  try {
+    // Check if user exists in Nabezky system
+    $existing_user = nb_woocommerce_wp_plugin_find_user_by_email($email);
+    $is_registered_user = ($existing_user !== FALSE);
+    
+    watchdog('nb_woocommerce_wp_plugin', 'User lookup result: @result', array('@result' => $is_registered_user ? 'registered' : 'anonymous'));
+    
+    // Determine voucher type and quantity based on amount
+    $season_pass_price = variable_get('nb_pass_cost', 20);
+    
+    watchdog('nb_woocommerce_wp_plugin', 'Voucher generation parameters - Amount: @amount, Season pass price: @price, Will generate: @type', 
+      array('@amount' => $amount, '@price' => $season_pass_price, '@type' => ($amount >= $season_pass_price) ? 'seasonal' : '3day'));
+    
+    $voucher_data = array(
+      'order_id' => $order_id,
+      'email' => $email,
+      'amount' => $amount,
+      'is_registered_user' => $is_registered_user,
+      'vouchers' => array(),
+    );
+    
+    if ($is_registered_user) {
+      // Handle registered user - update their access end date
+      $result = nb_woocommerce_wp_plugin_process_registered_user($existing_user, $amount, $season_pass_price);
+      $voucher_data['user_uid'] = $existing_user->uid;
+      $voucher_data['access_granted'] = TRUE;
+    } else {
+      // Generate vouchers for anonymous user
+      $vouchers = nb_woocommerce_wp_plugin_generate_vouchers($amount, $region_id, $email, $season_pass_price);
+      $voucher_data['vouchers'] = $vouchers;
+      
+      // Process vouchers (claim them for the user)
+      foreach ($vouchers as $voucher) {
+        nb_woocommerce_wp_plugin_process_voucher($voucher['number'], $email);
+      }
+    }
+    
+    // Send email to customer
+    nb_woocommerce_wp_plugin_send_voucher_email($email, $voucher_data);
+    
+    watchdog('nb_woocommerce_wp_plugin', 'Successfully processed order @order_id', array('@order_id' => $order_id));
+    
+    // Return JSON response directly to avoid Drupal Services serialization
+    $response = array(
+      'status' => 'success',
+      'message' => 'Voucher generated successfully',
+      'voucher_data' => $voucher_data
+    );
+    
+    // Set proper JSON headers and output
+    drupal_add_http_header('Content-Type', 'application/json');
+    drupal_add_http_header('Access-Control-Allow-Origin', '*');
+    drupal_add_http_header('Access-Control-Allow-Methods', 'POST, OPTIONS');
+    drupal_add_http_header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    
+    // Output JSON and exit to prevent Drupal from processing further
+    echo json_encode($response);
+    drupal_exit();
+    
+  } catch (Exception $e) {
+    watchdog('nb_woocommerce_wp_plugin', 'Error processing order @order_id: @error', 
+      array('@order_id' => $order_id, '@error' => $e->getMessage()), WATCHDOG_ERROR);
+    
+    // Return JSON error response
+    $error_response = array(
+      'status' => 'error',
+      'message' => 'Internal server error: ' . $e->getMessage(),
+      'error_code' => 500
+    );
+    
+    drupal_add_http_header('Content-Type', 'application/json');
+    http_response_code(500);
+    echo json_encode($error_response);
+    drupal_exit();
+  }
+}
+
+/**
+ * Find user by email address using proper Drupal 7 methods.
+ */
+function nb_woocommerce_wp_plugin_find_user_by_email($email) {
+  // Use entity_load_multiple_by_properties for proper user loading
+  $users = entity_load_multiple_by_properties('user', array('mail' => $email, 'status' => 1));
+  
+  if (!empty($users)) {
+    return reset($users);
+  }
+  
+  return FALSE;
+}
+
+/**
+ * Process registered user order.
+ */
+function nb_woocommerce_wp_plugin_process_registered_user($user, $amount, $season_pass_price) {
+  $usrobj = entity_metadata_wrapper('user', $user);
+  
+  if ($amount >= $season_pass_price) {
+    // Seasonal pass - set access until end of season
+    $end_date = rules_invoke_component('rules_end_of_ski_season')[0];
+    $usrobj->field_cc_access_end_date->set($end_date);
+  } else {
+    // 3-day access - extend current access by 3 days
+    $current_end = $usrobj->field_cc_access_end_date->value();
+    $new_end = max($current_end, time()) + (3 * 24 * 60 * 60);
+    $usrobj->field_cc_access_end_date->set($new_end);
+  }
+  
+  $usrobj->save();
+  
+  return TRUE;
+}
+
+/**
+ * Generate vouchers for anonymous user.
+ */
+function nb_woocommerce_wp_plugin_generate_vouchers($amount, $region_id, $email, $season_pass_price) {
+  $vouchers = array();
+
+  if ($amount >= $season_pass_price) {
+    // Generate seasonal voucher - force seasonal creation
+    watchdog('nb_woocommerce_wp_plugin', 'Creating seasonal voucher - Amount: @amount, Season pass price: @price', 
+      array('@amount' => $amount, '@price' => $season_pass_price));
+
+    // Try to get existing seasonal voucher first
+    $existing_seasonal = nb_woocommerce_wp_plugin_get_existing_seasonal_voucher($region_id);
+
+    if ($existing_seasonal) {
+      $vouchers[] = array(
+        'number' => $existing_seasonal,
+        'type' => 'seasonal',
+        'expires' => rules_invoke_component('rules_end_of_ski_season')[0],
+        'email' => $email,
+      );
+      watchdog('nb_woocommerce_wp_plugin', 'Used existing seasonal voucher: @number', array('@number' => $existing_seasonal));
+    }
+    else {
+      // Force create new seasonal voucher
+      $voucher_number = nb_woocommerce_wp_plugin_force_create_seasonal_voucher($region_id);
+      if ($voucher_number) {
+        $vouchers[] = array(
+          'number' => $voucher_number,
+          'type' => 'seasonal',
+          'expires' => rules_invoke_component('rules_end_of_ski_season')[0],
+          'email' => $email,
+        );
+        watchdog('nb_woocommerce_wp_plugin', 'Created new seasonal voucher: @number', array('@number' => $voucher_number));
+      }
+      else {
+        watchdog('nb_woocommerce_wp_plugin', 'Failed to create seasonal voucher - falling back to 3-day', array(), WATCHDOG_ERROR);
+        // Fallback to 3-day voucher
+        $voucher_number = nb_woocommerce_wp_plugin_create_voucher($region_id, 3);
+        if ($voucher_number) {
+          $vouchers[] = array(
+            'number' => $voucher_number,
+            'type' => '3day',
+            'expires' => time() + (3 * 24 * 60 * 60),
+            'email' => $email,
+          );
+        }
+      }
+    }
+  } else {
+    // Generate 3-day vouchers
+    $voucher_count = ceil($amount / 3);
+    for ($i = 0; $i < $voucher_count; $i++) {
+      $voucher_number = nb_woocommerce_wp_plugin_create_voucher($region_id, 3); // 3 = 3 days
+      if ($voucher_number) {
+        $vouchers[] = array(
+          'number' => $voucher_number,
+          'type' => '3day',
+          'expires' => time() + (3 * 24 * 60 * 60),
+          'email' => $email,
+        );
+      }
+    }
+  }
+  
+  return $vouchers;
+}
+
+/**
+ * Get existing seasonal voucher from database.
+ */
+function nb_woocommerce_wp_plugin_get_existing_seasonal_voucher($region_id) {
+  $ess = rules_invoke_component('rules_end_of_ski_season');
+  $season_end_year = (int)date('Y', $ess[0]);
+  $season_start_year = $season_end_year - 1;
+  $seasonNum = (($season_start_year - 2023) % 9) + 1;
+  
+  $existing_voucher = db_select('vouchers', 't')
+    ->fields('t', array('voucher_number'))
+    ->condition('holder_uid', NULL)
+    ->condition('holder_email', NULL)
+    ->condition('voucher_number', db_like($seasonNum . str_pad($region_id, 2, '0', STR_PAD_LEFT) . '0') . '%', 'LIKE')
+    ->where('LENGTH(CAST(voucher_number AS CHAR)) = :length', array(':length' => 13))
+    ->range(0, 1)
+    ->execute()
+    ->fetchField();
+    
+  return $existing_voucher;
+}
+
+/**
+ * Force create seasonal voucher by directly inserting into database.
+ */
+function nb_woocommerce_wp_plugin_force_create_seasonal_voucher($region_id) {
+  $ess = rules_invoke_component('rules_end_of_ski_season');
+  $season_end_year = (int)date('Y', $ess[0]);
+  $season_start_year = $season_end_year - 1;
+  $seasonNum = (($season_start_year - 2023) % 9) + 1;
+  
+  // Generate unique voucher number
+  $voucher_number = $seasonNum . str_pad($region_id, 2, '0', STR_PAD_LEFT) . '0' . str_pad(rand(1, 999999), 6, '0', STR_PAD_LEFT);
+  
+  // Insert voucher directly into database with seasonal expiration
+  try {
+    db_insert('vouchers')
+      ->fields(array(
+        'voucher_number' => $voucher_number,
+        'holder_uid' => NULL,
+        'holder_email' => NULL,
+        'start_date' => 0,
+        'end_date' => $ess[0], // End of season
+      ))
+      ->execute();
+      
+    watchdog('nb_woocommerce_wp_plugin', 'Force created seasonal voucher: @number', array('@number' => $voucher_number));
+    return $voucher_number;
+  } catch (Exception $e) {
+    watchdog('nb_woocommerce_wp_plugin', 'Error force creating seasonal voucher: @error', array('@error' => $e->getMessage()), WATCHDOG_ERROR);
+    return FALSE;
+  }
+}
+
+/**
+ * Create a new voucher using existing Nabezky functions.
+ */
+function nb_woocommerce_wp_plugin_create_voucher($region_id, $duration) {
+  // Use existing voucher creation function
+  if (!function_exists('nb_gmm_get_or_create_internal_voucher')) {
+    watchdog('nb_woocommerce_wp_plugin', 'nb_gmm_get_or_create_internal_voucher function not found - nb_grooming_map module may not be enabled', array(), WATCHDOG_ERROR);
+    return FALSE;
+  }
+  
+  watchdog('nb_woocommerce_wp_plugin', 'Creating voucher - Region: @region, Duration: @duration', 
+    array('@region' => $region_id, '@duration' => $duration));
+  
+  $count = 500; // Number to generate if none exist
+  $voucher_obj = nb_gmm_get_or_create_internal_voucher($count, $duration, $region_id);
+  
+  if (isset($voucher_obj->voucher_number)) {
+    watchdog('nb_woocommerce_wp_plugin', 'Voucher created successfully - Number: @number', 
+      array('@number' => $voucher_obj->voucher_number));
+    return $voucher_obj->voucher_number;
+  }
+  
+  watchdog('nb_woocommerce_wp_plugin', 'Voucher creation failed - No voucher number returned', array(), WATCHDOG_ERROR);
+  return FALSE;
+}
+
+/**
+ * Process voucher (claim it for the user).
+ */
+function nb_woocommerce_wp_plugin_process_voucher($voucher_number, $email) {
+  // Use existing voucher claiming function
+  if (!function_exists('nb_gmm_check_claim_internal_voucher')) {
+    watchdog('nb_woocommerce_wp_plugin', 'nb_gmm_check_claim_internal_voucher function not found - nb_grooming_map module may not be enabled', array(), WATCHDOG_ERROR);
+    return FALSE;
+  }
+  
+  // This will mark the voucher as claimed and set expiration dates
+  nb_gmm_check_claim_internal_voucher($voucher_number, 0, $email, FALSE);
+}
+
+/**
+ * Send voucher email to customer.
+ */
+function nb_woocommerce_wp_plugin_send_voucher_email($email, $voucher_data) {
+  if ($voucher_data['is_registered_user']) {
+    // Send email for registered user
+    $subject = t('Na bežky! map - access granted');
+    $message = t('Welcome back to the Na bežky! trails grooming status map.');
+    $message .= '<br><br>';
+    $message .= t('As a registered user, you now have access to all premium features including the interactive map.');
+    $message .= '<br><br>';
+    $message .= t('Thank you for supporting cross-country skiing in Slovakia');
+  } else {
+    // Send email with voucher information
+    $subject = t('Na bežky! map - voucher verified');
+    $message = t('Welcome to the Na bežky! trails grooming status map.');
+    $message .= '<br><br>';
+    $message .= t('Please make sure to save your voucher number, as you might need it in the future, for example if you for any reason clear cookies in your browser.');
+    $message .= '<br><br>';
+    
+    foreach ($voucher_data['vouchers'] as $voucher) {
+      $message .= '<strong>' . $voucher['number'] . '</strong><br>';
+    }
+    
+    $message .= '<br><br>' . t('Thank you for supporting cross-country skiing in Slovakia');
+  }
+  
+  // Send email using existing Nabezky email system
+  rules_invoke_component('rules_send_email', $email, $subject, $message);
+}

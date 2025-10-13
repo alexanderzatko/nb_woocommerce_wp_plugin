@@ -1,0 +1,8 @@
+name = Na Bezky WooCommerce WP Plugin
+description = Integration module for WordPress WooCommerce plugin with Nábežky voucher system
+core = 7.x
+package = Na bezky
+version = 7.x-1.0
+dependencies[] = services
+dependencies[] = nb_grooming_map
+dependencies[] = nb_store
