@@ -187,17 +187,14 @@ function nb_woocommerce_wp_plugin_voucher_generation($access_token, $order_data)
       $voucher_data['access_granted'] = TRUE;
     } else {
       // Generate vouchers for anonymous user
-      $vouchers = nb_woocommerce_wp_plugin_generate_vouchers($amount, $region_id, $email, $season_pass_price);
+      $vouchers = nb_woocommerce_wp_plugin_get_or_create_voucher($amount, $region_id, $email, $season_pass_price);
       $voucher_data['vouchers'] = $vouchers;
       
-      // Process vouchers (claim them for the user)
-      foreach ($vouchers as $voucher) {
-        nb_woocommerce_wp_plugin_process_voucher($voucher['number'], $email);
-      }
+      // Vouchers are generated but not claimed - claiming will happen when user uses voucher number
     }
     
     // Send email to customer
-    nb_woocommerce_wp_plugin_send_voucher_email($email, $voucher_data);
+//    nb_woocommerce_wp_plugin_send_voucher_email($email, $voucher_data);
     
     watchdog('nb_woocommerce_wp_plugin', 'Successfully processed order @order_id', array('@order_id' => $order_id));
     
@@ -298,59 +295,38 @@ function nb_woocommerce_wp_plugin_process_registered_user($user, $amount, $seaso
 }
 
 /**
- * Generate vouchers for anonymous user.
+ * Get or create vouchers using nb_grooming_map logic.
+ * 
+ * @param float $amount Payment amount
+ * @param int $region_id Region ID (ski center ID)
+ * @param string $email User email address
+ * @param float $season_pass_price Season pass price threshold
+ * @return array Array of voucher data or empty array on error
  */
-function nb_woocommerce_wp_plugin_generate_vouchers($amount, $region_id, $email, $season_pass_price) {
+function nb_woocommerce_wp_plugin_get_or_create_voucher($amount, $region_id, $email, $season_pass_price) {
   $vouchers = array();
-
+  
+  // Determine voucher type and quantity based on payment amount
   if ($amount >= $season_pass_price) {
-    // Generate seasonal voucher - force seasonal creation
+    // Generate seasonal voucher
     watchdog('nb_woocommerce_wp_plugin', 'Creating seasonal voucher - Amount: @amount, Season pass price: @price', 
       array('@amount' => $amount, '@price' => $season_pass_price));
 
-    // Try to get existing seasonal voucher first
-    $existing_seasonal = nb_woocommerce_wp_plugin_get_existing_seasonal_voucher($region_id);
-
-    if ($existing_seasonal) {
+    $voucher_number = nb_woocommerce_wp_plugin_get_or_create_single_voucher($amount, $region_id, $season_pass_price);
+    if ($voucher_number) {
       $vouchers[] = array(
-        'number' => $existing_seasonal,
+        'number' => $voucher_number,
         'type' => 'seasonal',
         'expires' => rules_invoke_component('rules_end_of_ski_season')[0],
         'email' => $email,
       );
-      watchdog('nb_woocommerce_wp_plugin', 'Used existing seasonal voucher: @number', array('@number' => $existing_seasonal));
-    }
-    else {
-      // Force create new seasonal voucher
-      $voucher_number = nb_woocommerce_wp_plugin_force_create_seasonal_voucher($region_id);
-      if ($voucher_number) {
-        $vouchers[] = array(
-          'number' => $voucher_number,
-          'type' => 'seasonal',
-          'expires' => rules_invoke_component('rules_end_of_ski_season')[0],
-          'email' => $email,
-        );
-        watchdog('nb_woocommerce_wp_plugin', 'Created new seasonal voucher: @number', array('@number' => $voucher_number));
-      }
-      else {
-        watchdog('nb_woocommerce_wp_plugin', 'Failed to create seasonal voucher - falling back to 3-day', array(), WATCHDOG_ERROR);
-        // Fallback to 3-day voucher
-        $voucher_number = nb_woocommerce_wp_plugin_create_voucher($region_id, 3);
-        if ($voucher_number) {
-          $vouchers[] = array(
-            'number' => $voucher_number,
-            'type' => '3day',
-            'expires' => time() + (3 * 24 * 60 * 60),
-            'email' => $email,
-          );
-        }
-      }
+      watchdog('nb_woocommerce_wp_plugin', 'Generated seasonal voucher: @number', array('@number' => $voucher_number));
     }
   } else {
     // Generate 3-day vouchers
     $voucher_count = ceil($amount / 3);
     for ($i = 0; $i < $voucher_count; $i++) {
-      $voucher_number = nb_woocommerce_wp_plugin_create_voucher($region_id, 3); // 3 = 3 days
+      $voucher_number = nb_woocommerce_wp_plugin_get_or_create_single_voucher($amount, $region_id, $season_pass_price);
       if ($voucher_number) {
         $vouchers[] = array(
           'number' => $voucher_number,
@@ -366,98 +342,84 @@ function nb_woocommerce_wp_plugin_generate_vouchers($amount, $region_id, $email,
 }
 
 /**
- * Get existing seasonal voucher from database.
+ * Get or create a single voucher using nb_grooming_map logic.
+ * 
+ * @param float $amount Payment amount
+ * @param int $region_id Region ID (ski center ID)
+ * @param float $season_pass_price Season pass price threshold
+ * @return string|false Voucher number or FALSE on error
  */
-function nb_woocommerce_wp_plugin_get_existing_seasonal_voucher($region_id) {
+function nb_woocommerce_wp_plugin_get_or_create_single_voucher($amount, $region_id, $season_pass_price) {
+  // Determine voucher type based on payment amount
+  $duration = ($amount >= $season_pass_price) ? 0 : 3; // 0 = seasonal, 3 = 3-day
+  
+  // Calculate season number (same logic as nb_grooming_map)
   $ess = rules_invoke_component('rules_end_of_ski_season');
   $season_end_year = (int)date('Y', $ess[0]);
-  $season_start_year = $season_end_year - 1;
-  $seasonNum = (($season_start_year - 2023) % 9) + 1;
+  $seasonNum = (($season_end_year - 2024) % 9) + 1;
+  
+  // Look for existing unclaimed voucher
+  $ski_center_id = str_pad($region_id, 2, '0', STR_PAD_LEFT);
+  $prefix = $seasonNum . $ski_center_id . $duration;
   
   $existing_voucher = db_select('vouchers', 't')
     ->fields('t', array('voucher_number'))
     ->condition('holder_uid', NULL)
     ->condition('holder_email', NULL)
-    ->condition('voucher_number', db_like($seasonNum . str_pad($region_id, 2, '0', STR_PAD_LEFT) . '0') . '%', 'LIKE')
+    ->condition('voucher_number', db_like($prefix) . '%', 'LIKE')
     ->where('LENGTH(CAST(voucher_number AS CHAR)) = :length', array(':length' => 13))
     ->range(0, 1)
     ->execute()
     ->fetchField();
-    
-  return $existing_voucher;
-}
-
-/**
- * Force create seasonal voucher by directly inserting into database.
- */
-function nb_woocommerce_wp_plugin_force_create_seasonal_voucher($region_id) {
-  $ess = rules_invoke_component('rules_end_of_ski_season');
-  $season_end_year = (int)date('Y', $ess[0]);
-  $season_start_year = $season_end_year - 1;
-  $seasonNum = (($season_start_year - 2023) % 9) + 1;
   
-  // Generate unique voucher number
-  $voucher_number = $seasonNum . str_pad($region_id, 2, '0', STR_PAD_LEFT) . '0' . str_pad(rand(1, 999999), 6, '0', STR_PAD_LEFT);
+  if ($existing_voucher) {
+    watchdog('nb_woocommerce_wp_plugin', 'Found existing unclaimed voucher: @voucher', 
+      array('@voucher' => $existing_voucher));
+    return $existing_voucher;
+  }
   
-  // Insert voucher directly into database with seasonal expiration
+  // No existing voucher found, create new ones using nb_grooming_map logic
+  if (!function_exists('nb_gmm_populate_vouchers_table_dva')) {
+    watchdog('nb_woocommerce_wp_plugin', 'nb_gmm_populate_vouchers_table_dva function not found - nb_grooming_map module may not be enabled', array(), WATCHDOG_ERROR);
+    return FALSE;
+  }
+  
+  // Create vouchers using the grooming map module
+  $ski_centers = array(
+    array($region_id, ($duration == 3) ? 1 : 0, ($duration == 0) ? 1 : 0)
+  );
+  
   try {
-    db_insert('vouchers')
-      ->fields(array(
-        'voucher_number' => $voucher_number,
-        'holder_uid' => NULL,
-        'holder_email' => NULL,
-        'start_date' => 0,
-        'end_date' => $ess[0], // End of season
-      ))
-      ->execute();
+    $created_count = nb_gmm_populate_vouchers_table_dva($ski_centers, 0, 999999999, 10, 9);
+    
+    if ($created_count > 0) {
+      // Get one of the newly created vouchers
+      $new_voucher = db_select('vouchers', 't')
+        ->fields('t', array('voucher_number'))
+        ->condition('holder_uid', NULL)
+        ->condition('holder_email', NULL)
+        ->condition('voucher_number', db_like($prefix) . '%', 'LIKE')
+        ->where('LENGTH(CAST(voucher_number AS CHAR)) = :length', array(':length' => 13))
+        ->range(0, 1)
+        ->execute()
+        ->fetchField();
       
-    watchdog('nb_woocommerce_wp_plugin', 'Force created seasonal voucher: @number', array('@number' => $voucher_number));
-    return $voucher_number;
+      if ($new_voucher) {
+        watchdog('nb_woocommerce_wp_plugin', 'Created new voucher: @voucher', 
+          array('@voucher' => $new_voucher));
+        return $new_voucher;
+      }
+    }
   } catch (Exception $e) {
-    watchdog('nb_woocommerce_wp_plugin', 'Error force creating seasonal voucher: @error', array('@error' => $e->getMessage()), WATCHDOG_ERROR);
-    return FALSE;
-  }
-}
-
-/**
- * Create a new voucher using existing Nabezky functions.
- */
-function nb_woocommerce_wp_plugin_create_voucher($region_id, $duration) {
-  // Use existing voucher creation function
-  if (!function_exists('nb_gmm_get_or_create_internal_voucher')) {
-    watchdog('nb_woocommerce_wp_plugin', 'nb_gmm_get_or_create_internal_voucher function not found - nb_grooming_map module may not be enabled', array(), WATCHDOG_ERROR);
-    return FALSE;
+    watchdog('nb_woocommerce_wp_plugin', 'Error creating vouchers: @error', 
+      array('@error' => $e->getMessage()), WATCHDOG_ERROR);
   }
   
-  watchdog('nb_woocommerce_wp_plugin', 'Creating voucher - Region: @region, Duration: @duration', 
-    array('@region' => $region_id, '@duration' => $duration));
-  
-  $count = 500; // Number to generate if none exist
-  $voucher_obj = nb_gmm_get_or_create_internal_voucher($count, $duration, $region_id);
-  
-  if (isset($voucher_obj->voucher_number)) {
-    watchdog('nb_woocommerce_wp_plugin', 'Voucher created successfully - Number: @number', 
-      array('@number' => $voucher_obj->voucher_number));
-    return $voucher_obj->voucher_number;
-  }
-  
-  watchdog('nb_woocommerce_wp_plugin', 'Voucher creation failed - No voucher number returned', array(), WATCHDOG_ERROR);
   return FALSE;
 }
 
-/**
- * Process voucher (claim it for the user).
- */
-function nb_woocommerce_wp_plugin_process_voucher($voucher_number, $email) {
-  // Use existing voucher claiming function
-  if (!function_exists('nb_gmm_check_claim_internal_voucher')) {
-    watchdog('nb_woocommerce_wp_plugin', 'nb_gmm_check_claim_internal_voucher function not found - nb_grooming_map module may not be enabled', array(), WATCHDOG_ERROR);
-    return FALSE;
-  }
-  
-  // This will mark the voucher as claimed and set expiration dates
-  nb_gmm_check_claim_internal_voucher($voucher_number, 0, $email, FALSE);
-}
+
+
 
 /**
  * Send voucher email to customer.
