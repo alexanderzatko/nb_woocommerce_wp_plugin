@@ -8,12 +8,14 @@
  * Implements hook_services_resources().
  */
 function nb_woocommerce_wp_plugin_services_resources() {
+
   return array(
     'woocommerce-voucher-generation' => array(
       'operations' => array(
         'create' => array(
           'help' => 'Generate voucher for WooCommerce order',
           'callback' => 'nb_woocommerce_wp_plugin_voucher_generation',
+          'access callback' => 'nb_woocommerce_wp_plugin_access_check',
           'args' => array(
             array(
               'name' => 'access_token',

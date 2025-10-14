@@ -72,6 +72,14 @@ function nb_woocommerce_wp_plugin_admin_form_submit($form, &$form_state) {
 }
 
 /**
+ * Access callback for Services endpoint.
+ */
+function nb_woocommerce_wp_plugin_access_check() {
+  // Allow access to the endpoint - authentication is handled within the callback
+  return TRUE;
+}
+
+/**
  * Services endpoint for voucher generation.
  * 
  * This function processes WooCommerce orders and generates appropriate vouchers.
@@ -232,19 +240,21 @@ function nb_woocommerce_wp_plugin_voucher_generation($access_token, $order_data)
  * Find user by email address using proper Drupal 7 methods.
  */
 function nb_woocommerce_wp_plugin_find_user_by_email($email) {
-  // Use entity_load_multiple_by_properties for proper user loading
-  $users = entity_load_multiple_by_properties('user', array('mail' => $email, 'status' => 1));
+  // Use standard Drupal 7 user loading approach
+  $uid = db_select('users', 'u')
+    ->fields('u', array('uid'))
+    ->condition('mail', $email)
+    ->condition('status', 1)
+    ->range(0, 1)
+    ->execute()
+    ->fetchField();
   
-  if (!empty($users)) {
-    $user = reset($users);
-    // Ensure we have a proper user object by loading it again with user_load
-    if (isset($user->uid)) {
-      $full_user = user_load($user->uid);
-      if ($full_user && is_object($full_user) && isset($full_user->uid)) {
-        watchdog('nb_woocommerce_wp_plugin', 'Found registered user for email @email, uid: @uid', 
-          array('@email' => $email, '@uid' => $full_user->uid), WATCHDOG_INFO);
-        return $full_user;
-      }
+  if ($uid) {
+    $user = user_load($uid);
+    if ($user && is_object($user) && isset($user->uid)) {
+      watchdog('nb_woocommerce_wp_plugin', 'Found registered user for email @email, uid: @uid', 
+        array('@email' => $email, '@uid' => $user->uid), WATCHDOG_INFO);
+      return $user;
     }
   }
   
