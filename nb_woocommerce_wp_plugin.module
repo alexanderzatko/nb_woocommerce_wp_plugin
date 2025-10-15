@@ -52,6 +52,15 @@ function nb_woocommerce_wp_plugin_admin_form($form, &$form_state) {
     '#size' => 10,
   );
   
+  $form['three_day_voucher_price'] = array(
+    '#type' => 'textfield',
+    '#title' => t('3-Day Voucher Price'),
+    '#description' => t('Price per 3-day voucher. Used to calculate how many vouchers to generate based on payment amount.'),
+    '#default_value' => variable_get('nb_woocommerce_wp_plugin_three_day_voucher_price', 3),
+    '#size' => 10,
+    '#required' => TRUE,
+  );
+  
   $form['submit'] = array(
     '#type' => 'submit',
     '#value' => t('Save Configuration'),
@@ -67,6 +76,7 @@ function nb_woocommerce_wp_plugin_admin_form_submit($form, &$form_state) {
   $tokens = array_filter(array_map('trim', explode("\n", $form_state['values']['allowed_tokens'])));
   variable_set('nb_woocommerce_wp_plugin_tokens', $tokens);
   variable_set('nb_woocommerce_wp_plugin_callback_timeout', $form_state['values']['callback_timeout']);
+  variable_set('nb_woocommerce_wp_plugin_three_day_voucher_price', floatval($form_state['values']['three_day_voucher_price']));
   
   drupal_set_message(t('Configuration saved successfully.'));
 }
@@ -338,7 +348,8 @@ function nb_woocommerce_wp_plugin_get_or_create_voucher($amount, $region_id, $em
     }
   } else {
     // Generate 3-day vouchers
-    $voucher_count = ceil($amount / 3);
+    $three_day_price = variable_get('nb_woocommerce_wp_plugin_three_day_voucher_price', 3);
+    $voucher_count = ceil($amount / $three_day_price);
     for ($i = 0; $i < $voucher_count; $i++) {
       $voucher_number = nb_woocommerce_wp_plugin_get_or_create_single_voucher($amount, $region_id, $season_pass_price);
       if ($voucher_number) {
@@ -354,7 +365,7 @@ function nb_woocommerce_wp_plugin_get_or_create_voucher($amount, $region_id, $em
         $vouchers[] = array(
           'number' => $voucher_number,
           'type' => '3day',
-          'expires' => time() + (3 * 24 * 60 * 60),
+          'expires' => NULL,
           'email' => $email,
           'claimed' => TRUE,
         );
