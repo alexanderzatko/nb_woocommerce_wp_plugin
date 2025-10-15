@@ -186,11 +186,9 @@ function nb_woocommerce_wp_plugin_voucher_generation($access_token, $order_data)
       $voucher_data['user_uid'] = $existing_user->uid;
       $voucher_data['access_granted'] = TRUE;
     } else {
-      // Generate vouchers for anonymous user
+      // Generate and claim vouchers for anonymous user
       $vouchers = nb_woocommerce_wp_plugin_get_or_create_voucher($amount, $region_id, $email, $season_pass_price);
       $voucher_data['vouchers'] = $vouchers;
-      
-      // Vouchers are generated but not claimed - claiming will happen when user uses voucher number
     }
     
     // Send email to customer
@@ -306,6 +304,12 @@ function nb_woocommerce_wp_plugin_process_registered_user($user, $amount, $seaso
 function nb_woocommerce_wp_plugin_get_or_create_voucher($amount, $region_id, $email, $season_pass_price) {
   $vouchers = array();
   
+  // Check if claiming function is available
+  if (!function_exists('nb_gmm_check_claim_internal_voucher')) {
+    watchdog('nb_woocommerce_wp_plugin', 'nb_gmm_check_claim_internal_voucher function not found - nb_grooming_map module may not be enabled', array(), WATCHDOG_ERROR);
+    throw new Exception('Required claiming function not available');
+  }
+  
   // Determine voucher type and quantity based on payment amount
   if ($amount >= $season_pass_price) {
     // Generate seasonal voucher
@@ -314,13 +318,23 @@ function nb_woocommerce_wp_plugin_get_or_create_voucher($amount, $region_id, $em
 
     $voucher_number = nb_woocommerce_wp_plugin_get_or_create_single_voucher($amount, $region_id, $season_pass_price);
     if ($voucher_number) {
+      // Claim the voucher immediately
+      $claim_result = nb_gmm_check_claim_internal_voucher($voucher_number, 0, $email, TRUE);
+      
+      if (!$claim_result) {
+        watchdog('nb_woocommerce_wp_plugin', 'Failed to claim seasonal voucher: @number for email: @email', 
+          array('@number' => $voucher_number, '@email' => $email), WATCHDOG_ERROR);
+        throw new Exception('Failed to claim seasonal voucher: ' . $voucher_number);
+      }
+      
       $vouchers[] = array(
         'number' => $voucher_number,
         'type' => 'seasonal',
         'expires' => rules_invoke_component('rules_end_of_ski_season')[0],
         'email' => $email,
+        'claimed' => TRUE,
       );
-      watchdog('nb_woocommerce_wp_plugin', 'Generated seasonal voucher: @number', array('@number' => $voucher_number));
+      watchdog('nb_woocommerce_wp_plugin', 'Generated and claimed seasonal voucher: @number', array('@number' => $voucher_number));
     }
   } else {
     // Generate 3-day vouchers
@@ -328,12 +342,23 @@ function nb_woocommerce_wp_plugin_get_or_create_voucher($amount, $region_id, $em
     for ($i = 0; $i < $voucher_count; $i++) {
       $voucher_number = nb_woocommerce_wp_plugin_get_or_create_single_voucher($amount, $region_id, $season_pass_price);
       if ($voucher_number) {
+        // Claim the voucher immediately
+        $claim_result = nb_gmm_check_claim_internal_voucher($voucher_number, 0, $email, TRUE);
+        
+        if (!$claim_result) {
+          watchdog('nb_woocommerce_wp_plugin', 'Failed to claim 3-day voucher: @number for email: @email', 
+            array('@number' => $voucher_number, '@email' => $email), WATCHDOG_ERROR);
+          throw new Exception('Failed to claim 3-day voucher: ' . $voucher_number);
+        }
+        
         $vouchers[] = array(
           'number' => $voucher_number,
           'type' => '3day',
           'expires' => time() + (3 * 24 * 60 * 60),
           'email' => $email,
+          'claimed' => TRUE,
         );
+        watchdog('nb_woocommerce_wp_plugin', 'Generated and claimed 3-day voucher: @number', array('@number' => $voucher_number));
       }
     }
   }
@@ -421,33 +446,3 @@ function nb_woocommerce_wp_plugin_get_or_create_single_voucher($amount, $region_
 
 
 
-/**
- * Send voucher email to customer.
- */
-function nb_woocommerce_wp_plugin_send_voucher_email($email, $voucher_data) {
-  if ($voucher_data['is_registered_user']) {
-    // Send email for registered user
-    $subject = t('Na bežky! map - access granted');
-    $message = t('Welcome back to the Na bežky! trails grooming status map.');
-    $message .= '<br><br>';
-    $message .= t('As a registered user, you now have access to all premium features including the interactive map.');
-    $message .= '<br><br>';
-    $message .= t('Thank you for supporting cross-country skiing in Slovakia');
-  } else {
-    // Send email with voucher information
-    $subject = t('Na bežky! map - voucher verified');
-    $message = t('Welcome to the Na bežky! trails grooming status map.');
-    $message .= '<br><br>';
-    $message .= t('Please make sure to save your voucher number, as you might need it in the future, for example if you for any reason clear cookies in your browser.');
-    $message .= '<br><br>';
-    
-    foreach ($voucher_data['vouchers'] as $voucher) {
-      $message .= '<strong>' . $voucher['number'] . '</strong><br>';
-    }
-    
-    $message .= '<br><br>' . t('Thank you for supporting cross-country skiing in Slovakia');
-  }
-  
-  // Send email using existing Nabezky email system
-  rules_invoke_component('rules_send_email', $email, $subject, $message);
-}
